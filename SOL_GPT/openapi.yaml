@@ -1,11 +1,16 @@
-openapi: 3.0.1
+openapi: 3.0.0
 info:
-  title: SolanaGPT Plugin API
-  version: "1.1"
+  title: Solana Wallet Checker
+  version: 1.0.0
+
+servers:
+  - url: https://solgpt-production.up.railway.app
+
 paths:
   /wallet/{address}:
     get:
-      summary: Get token balances for a wallet
+      summary: Get wallet info
+      operationId: getWalletInfo
       parameters:
         - name: address
           in: path
@@ -14,47 +19,26 @@ paths:
             type: string
       responses:
         '200':
-          description: Wallet SPL token balances
+          description: Wallet data returned
           content:
-            application/json: {}
-  /price/{symbol}:
-    get:
-      summary: Get token price
-      parameters:
-        - name: symbol
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Token price data
-          content:
-            application/json: {}
-  /swap:
-    get:
-      summary: Simulate a token swap
-      parameters:
-        - name: input_mint
-          in: query
-          required: true
-          schema:
-            type: string
-          description: Mint address of the input token
-        - name: output_mint
-          in: query
-          required: true
-          schema:
-            type: string
-          description: Mint address of the output token
-        - name: amount
-          in: query
-          required: true
-          schema:
-            type: number
-          description: Amount of input token to swap
-      responses:
-        '200':
-          description: Simulation result
-          content:
-            application/json: {}
+            application/json:
+              schema:
+                type: object
+                properties:
+                  address:
+                    type: string
+                  sol_balance:
+                    type: number
+                  tokens:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        mint:
+                          type: string
+                        amount:
+                          type: string
+                        decimals:
+                          type: integer
+        '404':
+          description: Wallet not found
