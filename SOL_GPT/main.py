@@ -1,11 +1,16 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import requests
+import os
 
-app = FastAPI()
+app = FastAPI(
+    title="SolanaGPT Plugin API",
+    description="Get Solana wallet info, token prices, and simulate swaps using Birdeye.",
+    version="1.0.0"
+)
 
-# Allow all origins for commercial/public API usage
+# CORS for GPT/Browser access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,35 +19,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Replace this with your preferred Solana data source
-SOLANA_API_BASE = "https://public-api.solscan.io/account"
-HEADERS = {"accept": "application/json"}
+# Load Birdeye API Key
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "your-api-key")
 
+# Health check
+@app.get("/")
+def root():
+    return {"message": "SolanaGPT API is live"}
+
+# Get wallet balance
 @app.get("/wallet/{address}")
-async def get_wallet_info(address: str):
-    clean_address = address.lstrip("/")  # remove accidental leading slashes
-    url = f"{SOLANA_API_BASE}/{clean_address}"
+def wallet_info(address: str):
+    url = f"https://public-api.birdeye.so/public/wallet/token_list?address={address}"
+    headers = {"x-api-key": BIRDEYE_API_KEY}
+    res = requests.get(url, headers=headers)
+    return res.json() if res.status_code == 200 else {"error": res.text}
 
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+# Get token price
+@app.get("/price/{symbol}")
+def get_token_price(symbol: str):
+    url = f"https://public-api.birdeye.so/public/price?address={symbol}"
+    headers = {"x-api-key": BIRDEYE_API_KEY}
+    res = requests.get(url, headers=headers)
+    return res.json() if res.status_code == 200 else {"error": res.text}
 
-        if response.status_code == 200:
-            data = response.json()
-            # Optional: Format it the way your frontend expects
-            return {
-                "address": clean_address,
-                "sol_balance": data.get("lamports", 0) / 1_000_000_000,  # Convert lamports to SOL
-                "tokens": data.get("tokenInfoList", [])
-            }
-
-        elif response.status_code == 404:
-            return JSONResponse(status_code=200, content={
-                "error": "Wallet inactive or empty",
-                "detail": f"Address {clean_address} not found or has no recent data."
-            })
-
-        else:
-            raise HTTPException(status_code=response.status_code, detail="Error fetching wallet info")
-
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Wallet data fetch failed: {str(e)}")
+# Simulate swap
+@app.get("/swap")
+def simulate_swap(input_mint: str, output_mint: str, amount: float):
+    return {
+        "input_mint": input_mint,
+        "output_mint": output_mint,
+        "amount": amount,
+        "estimated_output": round(amount * 1000, 2),  # mocked
+        "slippage": "0.5%",
+        "route": f"{input_mint[:4]}... → USDC → {output_mint[:4]}...",
+        "platform": "Jupiter Aggregator"
+    }
