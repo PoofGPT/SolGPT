@@ -2,10 +2,8 @@ openapi: 3.0.0
 info:
   title: Solana Wallet Checker
   version: 1.0.0
-
 servers:
   - url: https://solgpt-production.up.railway.app
-
 paths:
   /wallet/{address}:
     get:
