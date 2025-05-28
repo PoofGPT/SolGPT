@@ -12,7 +12,7 @@ from utils.trade import simulate_swap
 load_dotenv()
 PUBLIC_URL = os.getenv(
     "PUBLIC_URL",
-    "https://2ceb-2001-56a-7ac5-9600-7891-75c8-ba16-393d.ngrok-free.app"
+    "https://solgpt-production.up.railway.app/"
 )
 
 app = FastAPI(
