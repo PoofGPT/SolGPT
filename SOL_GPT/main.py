@@ -1,28 +1,12 @@
-import os
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
-from dotenv import load_dotenv
+from pydantic import BaseModel
+import requests
+import os
 
-from utils.rpc import get_wallet_info
-from utils.prices import get_token_price
-from utils.trade import simulate_swap
+app = FastAPI()
 
-# Load environment variables (including PUBLIC_URL)
-load_dotenv()
-PUBLIC_URL = os.getenv(
-    "PUBLIC_URL",
-    "https://solgpt-production.up.railway.app"
-)
-
-app = FastAPI(
-    title="SolanaGPT Plugin API",
-    version="1.1",
-    docs_url="/docs",
-    redoc_url=None,
-)
-
-# Allow ChatGPT (and any origin) to call your API
+# ✅ CORS setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,51 +15,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "your-birdeye-api-key")
+
+# ✅ Models
+class SwapRequest(BaseModel):
+    input_mint: str
+    output_mint: str
+    amount: float
+
+# ✅ Endpoints
 @app.get("/wallet/{address}")
 def wallet_info(address: str):
-    """
-    Get SPL token balances for a wallet address (and native SOL).
-    """
-    return get_wallet_info(address)
+    url = f"https://public-api.birdeye.so/public/wallet/token_list?address={address}"
+    headers = {"x-api-key": BIRDEYE_API_KEY}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    return {"error": "Failed to fetch wallet info", "detail": response.text}
 
 @app.get("/price/{symbol}")
-def price(symbol: str):
-    """
-    Get token price for a given token mint address or symbol.
-    """
-    return get_token_price(symbol)
+def get_token_price(symbol: str):
+    url = f"https://public-api.birdeye.so/public/price?address={symbol}"
+    headers = {"x-api-key": BIRDEYE_API_KEY}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    return {"error": "Failed to fetch token price", "detail": response.text}
 
 @app.get("/swap")
-def swap_simulation(
-    input_mint: str = Query(..., description="Mint address of the input token"),
-    output_mint: str = Query(..., description="Mint address of the output token"),
-    amount: float = Query(..., description="Amount of input token to swap"),
-):
-    """
-    Simulate a token swap from input_mint to output_mint.
-    """
-    return simulate_swap(input_mint, output_mint, amount)
-
-def custom_openapi():
-    """
-    Inject your public server URL into the OpenAPI schema so
-    the Custom GPT builder knows where to send requests.
-    """
-    if app.openapi_schema:
-        return app.openapi_schema
-
-    openapi_schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        routes=app.routes,
-    )
-    openapi_schema["servers"] = [{"url": PUBLIC_URL}]
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
-
-# Override the default openapi method
-app.openapi = custom_openapi
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+def simulate_swap(input_mint: str, output_mint: str, amount: float):
+    # This is mocked — replace with real Jupiter Aggregator logic if needed
+    return {
+        "input_mint": input_mint,
+        "output_mint": output_mint,
+        "amount": amount,
+        "estimated_output": amount * 1000,  # fake multiplier
+        "slippage": "0.5%",
+        "route": f"{input_mint[:4]}... → USDC → {output_mint[:4]}...",
+        "platform": "Jupiter"
+    }
