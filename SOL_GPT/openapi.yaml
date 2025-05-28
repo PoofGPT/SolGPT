@@ -1,0 +1,60 @@
+openapi: 3.0.1
+info:
+  title: SolanaGPT Plugin API
+  version: "1.1"
+paths:
+  /wallet/{address}:
+    get:
+      summary: Get token balances for a wallet
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Wallet SPL token balances
+          content:
+            application/json: {}
+  /price/{symbol}:
+    get:
+      summary: Get token price
+      parameters:
+        - name: symbol
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Token price data
+          content:
+            application/json: {}
+  /swap:
+    get:
+      summary: Simulate a token swap
+      parameters:
+        - name: input_mint
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Mint address of the input token
+        - name: output_mint
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Mint address of the output token
+        - name: amount
+          in: query
+          required: true
+          schema:
+            type: number
+          description: Amount of input token to swap
+      responses:
+        '200':
+          description: Simulation result
+          content:
+            application/json: {}
