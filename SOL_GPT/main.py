@@ -1,73 +1,48 @@
 import os
 import requests
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
+from fastapi import FastAPI, HTTPException
 
-app = FastAPI(
-    title="SolanaGPT Plugin API",
-    description="Fetch wallet balances, token prices, and simulate swaps on Solana memecoins.",
-    version="2.0.0"
-)
+app = FastAPI()
 
-# Middleware to allow frontend/GPT to call this
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Load your Helius API key from environment (or hard-code if you prefer, though env var is safer)
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "YOUR_HELIUS_API_KEY_HERE")
 
-# Load keys from env
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "c0c91b06-2f29-4038-8b5f-9d3ff220eb1c")
-
-@app.get("/")
-def home():
-    return {"message": "SolanaGPT API running ✅"}
-
-@app.get("/wallet/{address}")
-def get_wallet_balance(address: str):
-    url = f"https://api.helius.xyz/v0/addresses/{address}/balances?api-key={HELIUS_API_KEY}"
-    res = requests.get(url)
-    if res.status_code == 200:
-        return res.json()
-    else:
-        return {"error": res.text, "status_code": res.status_code}
-
-@app.get("/price/{symbol}")
-def get_token_price(symbol: str):
-    url = f"https://price.jup.ag/v4/price?ids={symbol}"
-    res = requests.get(url)
-    if res.status_code == 200:
-        return res.json()
-    else:
-        return {"error": res.text, "status_code": res.status_code}
-
-@app.get("/swap")
-def simulate_swap(input_mint: str, output_mint: str, amount: float):
-    return {
-        "input_mint": input_mint,
-        "output_mint": output_mint,
-        "input_amount": amount,
-        "estimated_output": round(amount * 1000, 2),
-        "slippage": "0.5%",
-        "route": "SOL → USDC → target token",
-        "platform": "Jupiter Aggregator (simulated)"
-    }
-
-# Patch OpenAPI with server URL
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
+@app.get("/price/{mint}")
+def get_token_price(mint: str):
+    """
+    Fetch token price from Helius Price API:
+    Endpoint: https://api.helius.xyz/v0/token/price?addresses[]=<mint>&api-key=<KEY>
+    Returns JSON containing price data or error message.
+    """
+    if not HELIUS_API_KEY or HELIUS_API_KEY == "YOUR_HELIUS_API_KEY_HERE":
+        raise HTTPException(
+            status_code=500,
+            detail="Helius API key not configured. Set HELIUS_API_KEY in environment.",
+        )
+    
+    helius_url = (
+        "https://api.helius.xyz/v0/token/price"
+        f"?addresses[]={mint}"
+        f"&api-key={HELIUS_API_KEY}"
     )
-    schema["servers"] = [{"url": os.getenv("PUBLIC_URL", "https://solgpt-production.up.railway.app")}]
-    app.openapi_schema = schema
-    return app.openapi_schema
-
-app.openapi = custom_openapi
+    
+    try:
+        response = requests.get(helius_url, timeout=10)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        # Handle network errors, timeouts, DNS issues, etc.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch price from Helius: {str(e)}"
+        )
+    
+    data = response.json()
+    # Helius returns a list, e.g. [{ "address": "...", "price": 0.123, … }]
+    if not isinstance(data, list) or len(data) == 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No price data found for mint {mint}"
+        )
+    
+    # Return exactly what the user expects (you can adjust formatting if desired)
+    return data[0]
