@@ -211,6 +211,12 @@ async def simulate_swap(
     except Exception as e:
         raise HTTPException(502, detail=f"Swap error: {str(e)}")
 
+@app.get("/")
+def root():
+    return {
+        "message": "Endpoints: /price/{identifier} (mint or symbol), /wallet/{address} (via Helius optional), /swap (mock)."
+    }
+
 # ======= HEALTH ENDPOINT =======
 @app.get("/health")
 async def health_check():
