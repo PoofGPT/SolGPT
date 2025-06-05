@@ -12,7 +12,7 @@ from typing import List, Dict
 
 app = FastAPI(
     title="Ultimate Solana Price API",
-    version="1.0.0",
+    version="1.0.1",
     description="Fetch USD prices for any Solana SPL token (obscure or popular) via Jupiter & CoinGecko",
 )
 
@@ -36,7 +36,7 @@ JUPITER_QUOTE_API       = "https://quote-api.jup.ag/v1/quote"
 HELIUS_BALANCE_URL      = "https://api.helius.xyz/v0/addresses/{address}/balances"
 HELIUS_TOKEN_METADATA   = "https://api.helius.xyz/v0/tokens"
 
-# On‐chain SPL token list (symbol→mint)
+# On-chain SPL token list (symbol→mint)
 TOKEN_LIST_URLS = [
     "https://cdn.jsdelivr.net/gh/solana-labs/token-list@main/src/tokens/solana.tokenlist.json",
     "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
@@ -73,7 +73,7 @@ def load_spl_token_list() -> List[Dict]:
 def load_coingecko_list() -> List[Dict]:
     """
     Download and cache CoinGecko's coin list including platform addresses.
-    Each entry includes: id, symbol, name, platforms (e.g. {"ethereum":..., "solana":<mint>})
+    Each entry includes: id, symbol, name, platforms (e.g. {"solana":<mint>})
     """
     r = requests.get(COINGECKO_LIST_URL, timeout=10)
     r.raise_for_status()
@@ -94,7 +94,7 @@ def build_coingecko_mappings():
         symbol_to_cgid[sym] = cg_id
 
         platforms = entry.get("platforms", {})
-        sol_mint = platforms.get("solana")    # If tracked on Solana, this field holds its mint address
+        sol_mint = platforms.get("solana")    # If tracked on Solana, holds its mint address
         if sol_mint:
             mint_to_cgid[sol_mint] = cg_id
 
@@ -102,25 +102,25 @@ def build_coingecko_mappings():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Resolve “identifier” (symbol or raw mint) → SPL mint address
+# Resolve “symbol” (or raw mint) → SPL mint address
 # ─────────────────────────────────────────────────────────────────────────────
-def resolve_identifier(identifier: str) -> str:
+def resolve_symbol_or_mint(symbol: str) -> str:
     """
     1) Uppercase + strip any leading '$'.
-    2) If it looks like a mint (32–44 length & alphanumeric), return as‐is.
+    2) If it looks like a mint (32–44 length & alphanumeric), return as-is.
     3) If it’s “SOL” or “WSOL”, return WSOL_MINT.
-    4) Otherwise, look through the SPL token list for symbol match → return its mint.
-    5) If still not found, raise 404.
+    4) If it’s “USDC”, return USDC_MINT.
+    5) Otherwise, search SPL token list for symbol match → return its mint.
+    6) If still not found, raise 404.
     """
-    raw = identifier.strip().upper().lstrip("$").strip()
+    raw = symbol.strip().upper().lstrip("$").strip()
 
-    # Special cases
     if raw in ("SOL", "WSOL"):
         return WSOL_MINT
     if raw == "USDC":
         return USDC_MINT
 
-    # If it looks like a mint address (32–44 chars alphanumeric)
+    # If it resembles a mint address (32–44 chars, alphanumeric)
     if 32 <= len(raw) <= 44 and raw.isalnum():
         return raw
 
@@ -129,7 +129,7 @@ def resolve_identifier(identifier: str) -> str:
         if token.get("symbol", "").upper() == raw:
             return token.get("address")
 
-    raise HTTPException(status_code=404, detail=f"Token '{identifier}' not found")
+    raise HTTPException(status_code=404, detail=f"Token '{symbol}' not found")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,7 +140,7 @@ async def root():
     return {
         "message": "Solana Price API",
         "endpoints": {
-            "price": "/price/{token_symbol_or_mint}",
+            "price": "/price/{symbol_or_mint}",
             "wallet": "/wallet/{address}",
             "swap": "/swap?inputMint=...&outputMint=...&amount=..."
         },
@@ -149,24 +149,24 @@ async def root():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) GET /price/{identifier}
+# 1) GET /price/{symbol_or_mint}
 #    → Returns USD price for any SPL token (popular or obscure)
 #    Logic:
-#      • Resolve identifier → mint
+#      • Resolve symbol_or_mint → mint
 #      • If mint == USDC_MINT → return 1.0
 #      • Fetch decimals via Helius metadata
-#      • Try Jupiter quote for 1.0 token → USDC (on‐chain)
-#      • If Jupiter fails (no route or error), fallback to CoinGecko (off‐chain)
+#      • Try Jupiter quote for 1.0 token → USDC (on-chain)
+#      • If Jupiter fails, fallback to CoinGecko (off-chain)
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get(
-    "/price/{identifier}",
+    "/price/{symbol_or_mint}",
     summary="Get SPL token price",
     description="Fetch USD price of any Solana SPL token by mint or symbol (Jupiter → CoinGecko fallback).",
 )
-async def get_token_price(identifier: str):
+async def get_token_price(symbol_or_mint: str):
     # 1) Resolve to mint address
     try:
-        mint = resolve_identifier(identifier)
+        mint = resolve_symbol_or_mint(symbol_or_mint)
     except HTTPException as e:
         raise e
 
@@ -220,9 +220,9 @@ async def get_token_price(identifier: str):
     mint_to_cgid, symbol_to_cgid = build_coingecko_mappings()
     cg_id = mint_to_cgid.get(mint)
 
-    # If we still don’t have a CG ID, maybe identifier was a symbol:
+    # If we still don’t have a CG ID, maybe input was a symbol:
     if not cg_id:
-        sym = identifier.strip().upper().lstrip("$")
+        sym = symbol_or_mint.strip().upper().lstrip("$")
         cg_id = symbol_to_cgid.get(sym)
 
     if not cg_id:
@@ -301,8 +301,8 @@ async def simulate_swap(
     slippageBps: int = Query(50, description="Slippage in basis points")
 ):
     try:
-        in_mint  = resolve_identifier(inputMint)
-        out_mint = resolve_identifier(outputMint)
+        in_mint  = resolve_symbol_or_mint(inputMint)
+        out_mint = resolve_symbol_or_mint(outputMint)
     except HTTPException as e:
         raise e
 
