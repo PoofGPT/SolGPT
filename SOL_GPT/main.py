@@ -7,18 +7,55 @@ from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from functools import lru_cache
+from solana.rpc.api import Client
 
 app = FastAPI(
     title="SolGPT API",
-    version="0.1.1",
-    description="SolGPT—check Solana wallet balances and token prices via Helius",
+    version="0.2.0",
+    description="SolGPT—fetch SOL/SPL balances and price any token via Jupiter aggregator",
 )
 
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
-if not HELIUS_API_KEY:
-    raise RuntimeError("Please set the Helius_API_KEY environment variable")
+# ────────────────────────────────────────────────────────────────────────────
+# 1) RPC client for Solana (to fetch decimals via getTokenSupply)
+# ────────────────────────────────────────────────────────────────────────────
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+solana_client = Client(SOLANA_RPC_URL)
+
+# ────────────────────────────────────────────────────────────────────────────
+# 2) SPL Token List URL (symbol → mint)
+# ────────────────────────────────────────────────────────────────────────────
+TOKEN_LIST_URL = (
+    "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
+)
+
+@lru_cache(maxsize=1)
+def get_token_list_map() -> Dict[str, str]:
+    """
+    Download & cache SPL Token List → { SYMBOL (upper): mintAddress }
+    """
+    resp = requests.get(TOKEN_LIST_URL, timeout=10)
+    resp.raise_for_status()
+    tokens = resp.json().get("tokens", [])
+    mapping: Dict[str, str] = {}
+    for entry in tokens:
+        sym = entry.get("symbol", "").upper()
+        mint = entry.get("address", "")
+        if sym and mint:
+            mapping[sym] = mint
+    return mapping
 
 
+def resolve_symbol_to_mint(raw_symbol: str) -> Optional[str]:
+    """
+    Strip leading '$', uppercase, then check SPL Token List → mint address.
+    """
+    sym = raw_symbol.lstrip("$ ").upper()
+    return get_token_list_map().get(sym)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 3) Pydantic models
+# ────────────────────────────────────────────────────────────────────────────
 class TokenBalance(BaseModel):
     mint: str
     amount: str
@@ -33,195 +70,169 @@ class WalletResponse(BaseModel):
 
 class PriceResponse(BaseModel):
     address: str
-    price: float
-    symbol: Optional[str]
+    price_usd: float
+    source: str  # "jupiter" or "fallback"
 
 
-TOKEN_LIST_URL = (
-    "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
-)
-
-
-@lru_cache(maxsize=1)
-def get_token_list_map() -> Dict[str, str]:
-    """
-    Download & cache the SPL Token List → returns { SYMBOL (upper): mintAddress }.
-    """
-    try:
-        resp = requests.get(TOKEN_LIST_URL, timeout=10)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        raise RuntimeError(f"Unable to fetch SPL Token List: {e}")
-
-    payload = resp.json().get("tokens", [])
-    mapping: Dict[str, str] = {}
-    for entry in payload:
-        symbol = entry.get("symbol", "").upper()
-        mint = entry.get("address", "")
-        if symbol and mint:
-            mapping[symbol] = mint
-    return mapping
-
-
-def resolve_symbol_to_mint(raw_symbol: str) -> Optional[str]:
-    """
-    Strip leading '$' or whitespace, uppercase, and look up in SPL Token List.
-    """
-    symbol = raw_symbol.lstrip("$ ").upper()
-    return get_token_list_map().get(symbol)
-
-
+# ────────────────────────────────────────────────────────────────────────────
+# 4) Root endpoint
+# ────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
-        "message": "Welcome to SolGPT API. Available endpoints: /wallet/{address}, /price/{token}, /swap"
+        "message": "SolGPT API: /wallet/{address}, /price/{token_or_mint}"
     }
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 5) GET /wallet/{address} → fetch SOL + SPL balances via JSON-RPC
+# ────────────────────────────────────────────────────────────────────────────
 @app.get("/wallet/{address}", response_model=WalletResponse)
 def get_wallet_balance(address: str):
-    """
-    Returns SOL balance and SPL token balances for a given Solana wallet via Helius.
-    """
     if len(address) < 32 or len(address) > 44:
         raise HTTPException(status_code=400, detail="Invalid Solana address format")
 
-    helius_url = (
-        f"https://api.helius.xyz/v0/addresses/{address}/balances?api-key={HELIUS_API_KEY}"
-    )
-    try:
-        resp = requests.get(helius_url, timeout=10)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Error fetching balances from Helius: {e}"
-        )
+    # 5a) SOL balance
+    sol_resp = solana_client.get_balance(address)
+    if sol_resp.get("error"):
+        raise HTTPException(status_code=502, detail="Error fetching SOL balance via RPC")
+    lamports = sol_resp["result"]["value"]
+    sol_balance = lamports / 1e9
 
-    data = resp.json()
-    sol_lamports = data.get("lamports", 0)
-    sol_balance = sol_lamports / 1e9
+    # 5b) SPL token accounts
+    tokens_resp = solana_client.get_token_accounts_by_owner(
+        address,
+        {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+        encoding="jsonParsed",
+    )
+    if tokens_resp.get("error"):
+        raise HTTPException(status_code=502, detail="Error fetching token accounts via RPC")
 
     tokens: List[TokenBalance] = []
-    for t in data.get("tokens", []):
-        mint = t.get("mint", "")
-        raw_amt = t.get("amount", "0")
-        decimals = t.get("decimals", 0)
-        try:
-            human_amt = int(raw_amt) / (10 ** decimals) if decimals >= 0 else int(raw_amt)
-        except Exception:
-            human_amt = 0
-        tokens.append(
-            TokenBalance(
-                mint=mint,
-                amount=str(human_amt),
-                decimals=decimals,
-            )
-        )
+    for acct in tokens_resp["result"]["value"]:
+        info = acct["account"]["data"]["parsed"]["info"]
+        mint = info["mint"]
+        raw_amt = int(info["tokenAmount"]["amount"])
+        decimals = info["tokenAmount"]["decimals"]
+        human_amt = raw_amt / (10 ** decimals) if decimals >= 0 else raw_amt
+        tokens.append(TokenBalance(mint=mint, amount=str(human_amt), decimals=decimals))
 
     return WalletResponse(address=address, sol_balance=sol_balance, tokens=tokens)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 6) GET /price/{identifier} → use Jupiter aggregator to get price in USDC
+# ────────────────────────────────────────────────────────────────────────────
+JUPITER_QUOTE_API = "https://quote-api.jup.ag/v1/quote"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC on Solana (6 decimals)
+WSOL_MINT = "So11111111111111111111111111111111111111112"  # Wrapped SOL
+
 @app.get("/price/{identifier}", response_model=PriceResponse)
 def get_token_price(identifier: str):
     """
-    Accepts a token symbol (with or without leading '$') or a mint address.
-    Strips '$' if present, resolves symbol → mint via SPL Token List,
-    then fetches USD price via Helius.
+    Accepts either:
+      - Token symbol (e.g., "BONK" or "$BONK")
+      - Or mint address (32–44 char Base58)
+    Steps:
+      1) Normalize: strip '$', whitespace.
+      2) If length 32–44 alphanumeric → treat as mint.
+         Else try resolve_symbol_to_mint() → mint.
+         Special‐case "SOL" → WSOL mint.
+      3) Fetch token decimals via getTokenSupply.
+      4) If mint == USDC_MINT → return 1.0 USD.
+      5) Call Jupiter quote API: amount = 10^decimals, outputMint = USDC_MINT.
+      6) If Jupiter returns route → price = outAmount / 10^6.
+      7) Else raise 404.
     """
-    # Strip leading '$' and whitespace
     raw = identifier.strip()
     if raw.startswith("$"):
         raw = raw.lstrip("$").strip()
 
-    # Determine if 'raw' is a mint (32-44 char base58) or symbol
-    if 32 <= len(raw) <= 44 and all(c.isalnum() for c in raw):
+    # 1) Determine mint
+    if 32 <= len(raw) <= 44 and raw.isalnum():
         mint = raw
-        symbol = None
     else:
-        resolved = resolve_symbol_to_mint(raw)
-        if not resolved:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"'{identifier}' is not a valid mint or known symbol. "
-                    "Use a 32–44 char mint address or an SPL token symbol (e.g., BONK, $BONK)."
+        sym = raw.upper()
+        if sym == "SOL":
+            mint = WSOL_MINT
+        else:
+            resolved = resolve_symbol_to_mint(raw)
+            if not resolved:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"'{identifier}' not a valid mint or known SYMBOL"
                 )
-            )
-        mint = resolved
-        symbol = raw.upper()
+            mint = resolved
 
-    helius_url = (
-        f"https://api.helius.xyz/v0/token/price?addresses[]={mint}&api-key={HELIUS_API_KEY}"
-    )
-    try:
-        resp = requests.get(helius_url, timeout=10)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error fetching price from Helius: {e}")
+    # 2) If user asked price for USDC itself, it's always 1.0
+    if mint == USDC_MINT:
+        return PriceResponse(address=mint, price_usd=1.0, source="static")
 
-    prices = resp.json()
-    if not isinstance(prices, list) or not prices:
-        raise HTTPException(status_code=404, detail=f"No price data found for mint {mint}")
+    # 3) Fetch decimals via getTokenSupply
+    supply_resp = solana_client.get_token_supply(mint)
+    if supply_resp.get("error"):
+        raise HTTPException(status_code=502, detail="RPC error fetching token supply")
+    value = supply_resp["result"]["value"]
+    decimals = value.get("decimals")
+    if decimals is None:
+        raise HTTPException(status_code=404, detail="Cannot determine token decimals")
 
-    price_entry = prices[0]
-    # If Helius returns null or missing price, treat it as not found
-    if price_entry.get("price") is None:
-        raise HTTPException(status_code=404, detail=f"No USD price available for {mint}")
-
-    return PriceResponse(address=mint, price=price_entry.get("price", 0.0), symbol=symbol)
-
-
-@app.get("/swap")
-def simulate_swap(
-    input_mint: str = Query(..., alias="inputMint"),
-    output_mint: str = Query(..., alias="outputMint"),
-    amount: float = Query(...),
-):
-    """
-    Simulate a swap: returns a mocked route and estimated output.
-    Both query styles work:
-      /swap?inputMint=<mint>&outputMint=<mint>&amount=2
-      /swap?input_mint=<mint>&output_mint=<mint>&amount=2
-    """
-    if len(input_mint) < 32 or len(input_mint) > 44:
-        raise HTTPException(status_code=400, detail="Invalid inputMint format")
-    if len(output_mint) < 32 or len(output_mint) > 44:
-        raise HTTPException(status_code=400, detail="Invalid outputMint format")
-
-    estimated_output = round(amount * 1000, 6)
-    return {
-        "inputMint": input_mint,
-        "outputMint": output_mint,
-        "amount": amount,
-        "estimatedOutput": estimated_output,
-        "slippageBps": 50,
-        "route": ["SOL", "USDC", output_mint],
-        "platform": "Jupiter (mocked)",
+    # 4) Build Jupiter quote request for 1 token unit
+    amount_raw = 10 ** decimals
+    params = {
+        "inputMint": mint,
+        "outputMint": USDC_MINT,
+        "amount": amount_raw,
+        "slippageBps": 50  # 0.50% slippage allowance
     }
 
+    try:
+        r = requests.get(JUPITER_QUOTE_API, params=params, timeout=5)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Jupiter API error: {e}")
 
+    data = r.json().get("data", [])
+    if not data:
+        raise HTTPException(status_code=404, detail="No liquidity route found for this token")
+
+    # 5) Take the best route (first element)
+    best = data[0]
+    out_amount_str = best.get("outAmount")
+    if not out_amount_str:
+        raise HTTPException(status_code=404, detail="No output amount returned")
+
+    try:
+        out_amount = int(out_amount_str)
+    except ValueError:
+        raise HTTPException(status_code=500, detail="Invalid outAmount format")
+
+    # USDC has 6 decimals
+    price_usd = out_amount / 10**6
+
+    return PriceResponse(address=mint, price_usd=price_usd, source="jupiter")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 7) Override OpenAPI schema with only production server
+# ────────────────────────────────────────────────────────────────────────────
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
 
-    openapi_schema = get_openapi(
+    schema = get_openapi(
         title=app.title,
         version=app.version,
         description=app.description,
         routes=app.routes,
     )
-
-    # Only include your live HTTPS endpoint here
-    openapi_schema["servers"] = [
+    schema["servers"] = [
         {
             "url": "https://solgpt-production.up.railway.app",
             "description": "Production (Railway)"
         }
     ]
-
-    app.openapi_schema = openapi_schema
+    app.openapi_schema = schema
     return app.openapi_schema
-
 
 app.openapi = custom_openapi
