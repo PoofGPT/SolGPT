@@ -5,11 +5,12 @@ import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.openapi.utils import get_openapi
 from functools import lru_cache
+from typing import List, Dict
 
 app = FastAPI(
-    title="SolGPT API",
-    version="0.2.3",
-    description="Fetch wallet balances and USD prices for any SPL token",
+    title="SolPriceAPI",
+    version="0.3.0",
+    description="Fetch SOL/SPL balances and USD prices for any SPL token using Jupiter",
 )
 
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
@@ -25,35 +26,37 @@ WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 
 @lru_cache(maxsize=1)
-def get_symbol_map():
+def load_token_list() -> List[Dict]:
     """
-    Returns a dict { SYMBOL (uppercase) : mintAddress } from the SPL token list.
+    Download the SPL token list once and cache it.
+    Returns a list of entries, each with 'symbol', 'address', 'name', etc.
     """
     r = requests.get(TOKEN_LIST_URL, timeout=10)
     r.raise_for_status()
-    tokens = r.json().get("tokens", [])
-    return {
-        entry["symbol"].upper(): entry["address"]
-        for entry in tokens
-        if entry.get("symbol") and entry.get("address")
-    }
+    return r.json().get("tokens", [])
+
+
+def find_mint_for_symbol(symbol: str) -> str:
+    """
+    Given a symbol (case-insensitive), return its mint address.
+    Raises HTTPException if not found.
+    """
+    sym = symbol.upper().lstrip("$").strip()
+    for entry in load_token_list():
+        if entry.get("symbol", "").upper() == sym:
+            return entry["address"]
+    raise HTTPException(status_code=400, detail=f"Symbol '{symbol}' not found")
 
 
 @app.get("/")
 def root():
-    return {
-        "message": "SolGPT API: /wallet/{address}, /price/{token_or_mint}, /swap"
-    }
+    return {"message": "Endpoints: /wallet/{address}, /price/{token_or_mint}, /swap"}
 
 
 @app.get("/wallet/{address}")
 def get_wallet_balance(address: str):
-    """
-    Return SOL and SPL token balances for a given wallet.
-    """
     if len(address) < 32 or len(address) > 44:
         raise HTTPException(status_code=400, detail="Invalid Solana address format")
-
     url = HELIUS_BALANCE_URL.format(addr=address) + f"?api-key={HELIUS_API_KEY}"
     try:
         r = requests.get(url, timeout=10)
@@ -81,28 +84,24 @@ def get_wallet_balance(address: str):
 @app.get(
     "/price/{identifier}",
     summary="Get token price",
-    description="Fetch USD price of a token by mint or symbol using Jupiter",
+    description="Fetch USD price of an SPL token by mint or symbol using Jupiter",
 )
 def get_token_price(identifier: str):
-    raw = identifier.strip().lstrip("$").strip()
+    raw = identifier.strip()
+    # Determine mint: if length 32–44 and alphanumeric, treat as mint; else treat as symbol
     if 32 <= len(raw) <= 44 and raw.isalnum():
         mint = raw
     else:
-        sym = raw.upper()
-        if sym == "SOL":
+        if raw.upper() == "SOL":
             mint = WSOL_MINT
         else:
-            mint = get_symbol_map().get(sym)
-            if not mint:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"'{identifier}' is not a valid mint or known symbol"
-                )
+            mint = find_mint_for_symbol(raw)
 
+    # If user asked for USDC price, return 1.0
     if mint == USDC_MINT:
         return {"mint": mint, "price": 1.0, "source": "static"}
 
-    # fetch decimals via Helius
+    # Fetch decimals from Helius
     params = {"addresses[]": mint, "api-key": HELIUS_API_KEY}
     try:
         tm = requests.get(HELIUS_TOKEN_METADATA_URL, params=params, timeout=5)
@@ -117,12 +116,13 @@ def get_token_price(identifier: str):
     if dec is None:
         raise HTTPException(status_code=404, detail="Decimals unavailable")
 
+    # Quote 1 token via Jupiter
     amount_raw = 10 ** dec
     quote_params = {
         "inputMint": mint,
         "outputMint": USDC_MINT,
         "amount": amount_raw,
-        "slippageBps": 50
+        "slippageBps": 50,
     }
     try:
         jq = requests.get(JUPITER_QUOTE_API, params=quote_params, timeout=5)
@@ -139,7 +139,7 @@ def get_token_price(identifier: str):
         raise HTTPException(status_code=404, detail="No output amount returned")
 
     try:
-        usd_price = int(out_amt) / 10**6
+        usd_price = int(out_amt) / 10 ** 6
     except:
         raise HTTPException(status_code=500, detail="Invalid outAmount format")
 
@@ -150,19 +150,19 @@ def get_token_price(identifier: str):
 def simulate_swap(
     inputMint: str = Query(...),
     outputMint: str = Query(...),
-    amount: float = Query(...)
+    amount: float = Query(...),
 ):
     if len(inputMint) < 32 or len(inputMint) > 44 or len(outputMint) < 32 or len(outputMint) > 44:
         raise HTTPException(status_code=400, detail="Invalid mint format")
-    estimated = round(amount * 1000, 6)
+    est = round(amount * 1000, 6)
     return {
         "inputMint": inputMint,
         "outputMint": outputMint,
         "amount": amount,
-        "estimatedOutput": estimated,
+        "estimatedOutput": est,
         "slippageBps": 50,
         "route": ["SOL", "USDC", outputMint],
-        "platform": "Jupiter (mocked)"
+        "platform": "Jupiter (mocked)",
     }
 
 
@@ -177,7 +177,7 @@ def custom_openapi():
     )
     schema["servers"] = [
         {
-            "url": "https://solgpt-production.up.railway.app",
+            "url": "https://striking-illumination.up.railway.app",
             "description": "Production"
         }
     ]
