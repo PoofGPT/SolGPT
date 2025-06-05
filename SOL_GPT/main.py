@@ -4,6 +4,7 @@ import os
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.openapi.utils import get_openapi
+from fastapi.middleware.cors import CORSMiddleware
 from functools import lru_cache
 from typing import List, Dict
 
@@ -11,6 +12,16 @@ app = FastAPI(
     title="SolPriceAPI",
     version="0.3.0",
     description="Fetch SOL/SPL balances and USD prices for any SPL token using Jupiter",
+)
+
+# ────────────────────────────────────────────────────────────────────────────
+# Enable CORS so the docs UI can fetch from the API
+# ────────────────────────────────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],             # allow all origins
+    allow_methods=["*"],             # allow all HTTP methods
+    allow_headers=["*"],             # allow all headers
 )
 
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
@@ -55,8 +66,12 @@ def root():
 
 @app.get("/wallet/{address}")
 def get_wallet_balance(address: str):
+    """
+    Return SOL and SPL token balances for a given wallet via Helius.
+    """
     if len(address) < 32 or len(address) > 44:
         raise HTTPException(status_code=400, detail="Invalid Solana address format")
+
     url = HELIUS_BALANCE_URL.format(addr=address) + f"?api-key={HELIUS_API_KEY}"
     try:
         r = requests.get(url, timeout=10)
@@ -87,8 +102,12 @@ def get_wallet_balance(address: str):
     description="Fetch USD price of an SPL token by mint or symbol using Jupiter",
 )
 def get_token_price(identifier: str):
+    """
+    Determine mint from identifier (mint length or symbol), fetch decimals via Helius,
+    then get a price quote from Jupiter for 1 token unit (10**decimals) → USDC.
+    """
     raw = identifier.strip()
-    # Determine mint: if length 32–44 and alphanumeric, treat as mint; else treat as symbol
+    # If looks like a mint address, use it directly; else treat as symbol
     if 32 <= len(raw) <= 44 and raw.isalnum():
         mint = raw
     else:
@@ -97,11 +116,11 @@ def get_token_price(identifier: str):
         else:
             mint = find_mint_for_symbol(raw)
 
-    # If user asked for USDC price, return 1.0
+    # Static price if USDC
     if mint == USDC_MINT:
         return {"mint": mint, "price": 1.0, "source": "static"}
 
-    # Fetch decimals from Helius
+    # Fetch decimals from Helius token metadata
     params = {"addresses[]": mint, "api-key": HELIUS_API_KEY}
     try:
         tm = requests.get(HELIUS_TOKEN_METADATA_URL, params=params, timeout=5)
@@ -116,7 +135,7 @@ def get_token_price(identifier: str):
     if dec is None:
         raise HTTPException(status_code=404, detail="Decimals unavailable")
 
-    # Quote 1 token via Jupiter
+    # Quote 1 token → USDC via Jupiter
     amount_raw = 10 ** dec
     quote_params = {
         "inputMint": mint,
@@ -139,7 +158,7 @@ def get_token_price(identifier: str):
         raise HTTPException(status_code=404, detail="No output amount returned")
 
     try:
-        usd_price = int(out_amt) / 10 ** 6
+        usd_price = int(out_amt) / 10**6
     except:
         raise HTTPException(status_code=500, detail="Invalid outAmount format")
 
@@ -152,6 +171,9 @@ def simulate_swap(
     outputMint: str = Query(...),
     amount: float = Query(...),
 ):
+    """
+    Mock swap simulation: returns a dummy route and estimated output.
+    """
     if len(inputMint) < 32 or len(inputMint) > 44 or len(outputMint) < 32 or len(outputMint) > 44:
         raise HTTPException(status_code=400, detail="Invalid mint format")
     est = round(amount * 1000, 6)
