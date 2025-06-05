@@ -10,7 +10,7 @@ from functools import lru_cache
 
 app = FastAPI(
     title="SolGPT API",
-    version="0.1.0",
+    version="0.1.1",
     description="SolGPT—check Solana wallet balances and token prices via Helius",
 )
 
@@ -45,7 +45,7 @@ TOKEN_LIST_URL = (
 @lru_cache(maxsize=1)
 def get_token_list_map() -> Dict[str, str]:
     """
-    Download & cache SPL Token List → returns { SYMBOL (upper): mintAddress }.
+    Download & cache the SPL Token List → returns { SYMBOL (upper): mintAddress }.
     """
     try:
         resp = requests.get(TOKEN_LIST_URL, timeout=10)
@@ -53,9 +53,9 @@ def get_token_list_map() -> Dict[str, str]:
     except requests.RequestException as e:
         raise RuntimeError(f"Unable to fetch SPL Token List: {e}")
 
-    tokens_payload = resp.json().get("tokens", [])
+    payload = resp.json().get("tokens", [])
     mapping: Dict[str, str] = {}
-    for entry in tokens_payload:
+    for entry in payload:
         symbol = entry.get("symbol", "").upper()
         mint = entry.get("address", "")
         if symbol and mint:
@@ -63,8 +63,12 @@ def get_token_list_map() -> Dict[str, str]:
     return mapping
 
 
-def resolve_symbol_to_mint(symbol: str) -> Optional[str]:
-    return get_token_list_map().get(symbol.upper())
+def resolve_symbol_to_mint(raw_symbol: str) -> Optional[str]:
+    """
+    Strip leading '$' or whitespace, uppercase, and look up in SPL Token List.
+    """
+    symbol = raw_symbol.lstrip("$ ").upper()
+    return get_token_list_map().get(symbol)
 
 
 @app.get("/")
@@ -76,6 +80,9 @@ def root():
 
 @app.get("/wallet/{address}", response_model=WalletResponse)
 def get_wallet_balance(address: str):
+    """
+    Returns SOL balance and SPL token balances for a given Solana wallet via Helius.
+    """
     if len(address) < 32 or len(address) > 44:
         raise HTTPException(status_code=400, detail="Invalid Solana address format")
 
@@ -117,21 +124,32 @@ def get_wallet_balance(address: str):
 
 @app.get("/price/{identifier}", response_model=PriceResponse)
 def get_token_price(identifier: str):
-    if 32 <= len(identifier) <= 44:
-        mint = identifier
+    """
+    Accepts a token symbol (with or without leading '$') or a mint address.
+    Strips '$' if present, resolves symbol → mint via SPL Token List,
+    then fetches USD price via Helius.
+    """
+    # Strip leading '$' and whitespace
+    raw = identifier.strip()
+    if raw.startswith("$"):
+        raw = raw.lstrip("$").strip()
+
+    # Determine if 'raw' is a mint (32-44 char base58) or symbol
+    if 32 <= len(raw) <= 44 and all(c.isalnum() for c in raw):
+        mint = raw
         symbol = None
     else:
-        resolved_mint = resolve_symbol_to_mint(identifier)
-        if not resolved_mint:
+        resolved = resolve_symbol_to_mint(raw)
+        if not resolved:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"'{identifier}' is not a valid mint or known symbol. "
-                    "Provide a 32–44 char mint address or an SPL token symbol."
+                    "Use a 32–44 char mint address or an SPL token symbol (e.g., BONK, $BONK)."
                 )
             )
-        mint = resolved_mint
-        symbol = identifier.upper()
+        mint = resolved
+        symbol = raw.upper()
 
     helius_url = (
         f"https://api.helius.xyz/v0/token/price?addresses[]={mint}&api-key={HELIUS_API_KEY}"
@@ -147,6 +165,10 @@ def get_token_price(identifier: str):
         raise HTTPException(status_code=404, detail=f"No price data found for mint {mint}")
 
     price_entry = prices[0]
+    # If Helius returns null or missing price, treat it as not found
+    if price_entry.get("price") is None:
+        raise HTTPException(status_code=404, detail=f"No USD price available for {mint}")
+
     return PriceResponse(address=mint, price=price_entry.get("price", 0.0), symbol=symbol)
 
 
@@ -156,6 +178,12 @@ def simulate_swap(
     output_mint: str = Query(..., alias="outputMint"),
     amount: float = Query(...),
 ):
+    """
+    Simulate a swap: returns a mocked route and estimated output.
+    Both query styles work:
+      /swap?inputMint=<mint>&outputMint=<mint>&amount=2
+      /swap?input_mint=<mint>&output_mint=<mint>&amount=2
+    """
     if len(input_mint) < 32 or len(input_mint) > 44:
         raise HTTPException(status_code=400, detail="Invalid inputMint format")
     if len(output_mint) < 32 or len(output_mint) > 44:
@@ -184,7 +212,7 @@ def custom_openapi():
         routes=app.routes,
     )
 
-    # Only include the production (HTTPS) URL here
+    # Only include your live HTTPS endpoint here
     openapi_schema["servers"] = [
         {
             "url": "https://solgpt-production.up.railway.app",
