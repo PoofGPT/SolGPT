@@ -7,13 +7,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 from functools import lru_cache
 
-app = FastAPI(
-    title="SolGPT API",
-    servers=[
-        {"url": "http://localhost:8000", "description": "Local development"},
-        {"url": "https://solgpt-production.up.railway.app", "description": "Production"}
-    ],
-)
+app = FastAPI()
 
 # ────────────────────────────────────────────────────────────────────────────
 # 1) Load Helius API key from environment
@@ -45,7 +39,7 @@ class PriceResponse(BaseModel):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 3) Caching & resolving SPL Token List (symbol → mint) via on‐chain list
+# 3) Caching & resolving SPL Token List (symbol → mint) via on-chain list
 # ────────────────────────────────────────────────────────────────────────────
 TOKEN_LIST_URL = (
     "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
