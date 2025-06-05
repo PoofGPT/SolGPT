@@ -10,7 +10,7 @@ from functools import lru_cache
 
 app = FastAPI(
     title="SolGPT API",
-    version="0.2.1",
+    version="0.2.2",
     description="SolGPT—fetch SOL/SPL balances via Helius and price any token via Jupiter",
 )
 
@@ -120,29 +120,21 @@ def get_wallet_balance(address: str):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 6) GET /price/{identifier} → price via Jupiter (fetch decimals from Helius)
+# 6) GET /price/{identifier} → price via Jupiter
 # ────────────────────────────────────────────────────────────────────────────
-USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC (6 decimals)
-WSOL_MINT = "So11111111111111111111111111111111111111112"  # Wrapped SOL
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+WSOL_MINT = "So11111111111111111111111111111111111111112"
 
-@app.get("/price/{identifier}", response_model=PriceResponse)
+@app.get(
+    "/price/{identifier}",
+    response_model=PriceResponse,
+    summary="Get token price",
+    description="Fetch the USD price of a token by mint or symbol using Jupiter aggregator."
+)
 def get_token_price(identifier: str):
-    """
-    Accepts:
-      • Token symbol (e.g. "BONK", "$BONK", "USDC")
-      • OR mint address (32–44 char Base58).
-    Steps:
-      1) Strip '$', identify mint (direct or via SPL list; special‐case "SOL" → WSOL).
-      2) If mint == USDC_MINT, return price_usd = 1.0.
-      3) Fetch token decimals via Helius /tokens endpoint.
-      4) Query Jupiter: amount = 10**decimals, outputMint = USDC_MINT.
-      5) Calculate price_usd = outAmount / 10**6.
-    """
-    raw = identifier.strip()
-    if raw.startswith("$"):
-        raw = raw.lstrip("$").strip()
+    raw = identifier.strip().lstrip("$").strip()
 
-    # 1) Determine mint
+    # Determine mint
     if 32 <= len(raw) <= 44 and raw.isalnum():
         mint = raw
     else:
@@ -158,27 +150,27 @@ def get_token_price(identifier: str):
                 )
             mint = resolved
 
-    # 2) If USDC, fixed price
+    # Static price for USDC
     if mint == USDC_MINT:
         return PriceResponse(address=mint, price_usd=1.0, source="static")
 
-    # 3) Fetch token metadata (to get decimals) via Helius
+    # Get token metadata (decimals) via Helius
     params = {"addresses[]": mint, "api-key": HELIUS_API_KEY}
     try:
         tm_resp = requests.get(HELIUS_TOKEN_METADATA_URL, params=params, timeout=5)
         tm_resp.raise_for_status()
     except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Helius token metadata error: {e}")
+        raise HTTPException(status_code=502, detail=f"Helius metadata error: {e}")
 
     tm_data = tm_resp.json()
     if not isinstance(tm_data, list) or not tm_data:
         raise HTTPException(status_code=404, detail="Token metadata not found")
     decimals = tm_data[0].get("decimals")
     if decimals is None:
-        raise HTTPException(status_code=404, detail="Decimals not available for this token")
+        raise HTTPException(status_code=404, detail="Decimals not available")
 
-    # 4) Build Jupiter quote for 1 full token (10**decimals)
-    amount_raw = 10 ** decimals
+    # Quote 1 token via Jupiter
+    amount_raw = 10**decimals
     params = {
         "inputMint": mint,
         "outputMint": USDC_MINT,
@@ -193,10 +185,9 @@ def get_token_price(identifier: str):
 
     data = jq.json().get("data", [])
     if not data:
-        raise HTTPException(status_code=404, detail="No liquidity route found for this token")
+        raise HTTPException(status_code=404, detail="No liquidity route found")
 
-    best = data[0]
-    out_amount_str = best.get("outAmount")
+    out_amount_str = data[0].get("outAmount")
     if not out_amount_str:
         raise HTTPException(status_code=404, detail="No output amount returned")
 
@@ -205,13 +196,12 @@ def get_token_price(identifier: str):
     except ValueError:
         raise HTTPException(status_code=500, detail="Invalid outAmount format")
 
-    # USDC has 6 decimals
     price_usd = out_amount / 10**6
     return PriceResponse(address=mint, price_usd=price_usd, source="jupiter")
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 7) GET /swap → mock swap simulation (inputMint, outputMint, amount)
+# 7) GET /swap → mock swap simulation
 # ────────────────────────────────────────────────────────────────────────────
 @app.get("/swap")
 def simulate_swap(
