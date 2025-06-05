@@ -2,3 +2,4 @@ fastapi
 uvicorn
 requests
 python-dotenv
+httpx>=0.24.0
