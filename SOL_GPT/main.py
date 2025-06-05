@@ -1,3 +1,5 @@
+# main.py
+
 import os
 import requests
 from fastapi import FastAPI, HTTPException, Query
@@ -8,11 +10,11 @@ from functools import lru_cache
 app = FastAPI()
 
 # ────────────────────────────────────────────────────────────────────────────
-# 1) Helius API key must be set in environment:
-#    HELIUS_API_KEY = "your‐real‐helius‐key"
+# 1) Load Helius API key from the environment
 # ────────────────────────────────────────────────────────────────────────────
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 if not HELIUS_API_KEY:
+    # If running locally, set: export HELIUS_API_KEY="YOUR_KEY_HERE"
     raise RuntimeError("HELIUS_API_KEY environment variable is not set")
 
 
@@ -32,59 +34,54 @@ class WalletResponse(BaseModel):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 3) Helper: Fetch & cache the on-chain SPL Token List (so we can resolve symbols→mint)
+# 3) Caching & resolving SPL Token List (symbol → mint-address mapping)
 # ────────────────────────────────────────────────────────────────────────────
 TOKEN_LIST_URL = (
     "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
 )
 
 @lru_cache(maxsize=1)
-def get_token_list() -> Dict[str, str]:
+def get_token_list_map() -> Dict[str, str]:
     """
-    Download the SPL Token List JSON and build a dict mapping:
-       symbol_uppercase -> mint_address
-
-    This caches the result (LRU cache of size 1).  
+    Download and cache the on-chain SPL Token List, returning a dict:
+       { SYMBOL (uppercase): mintAddress }
     """
     try:
-        resp = requests.get(TOKEN_LIST_URL, timeout=10)
-        resp.raise_for_status()
+        r = requests.get(TOKEN_LIST_URL, timeout=10)
+        r.raise_for_status()
     except requests.exceptions.RequestException as e:
-        # If token list fetch fails, we can still proceed but symbol resolution won't work.
-        raise RuntimeException(f"Unable to fetch SPL Token List: {e}")
+        # If the token list fails, symbol resolution will not work
+        raise RuntimeError(f"Unable to fetch SPL Token List: {e}")
 
-    data = resp.json()
-    tokens = data.get("tokens", [])
+    obj = r.json()
+    entries = obj.get("tokens", [])
     symbol_to_mint: Dict[str, str] = {}
-    for entry in tokens:
+    for entry in entries:
         sym = entry.get("symbol", "").upper()
-        mint_addr = entry.get("address", "")
-        if sym and mint_addr:
-            symbol_to_mint[sym] = mint_addr
+        maddr = entry.get("address", "")
+        if sym and maddr:
+            symbol_to_mint[sym] = maddr
     return symbol_to_mint
 
 
-def resolve_symbol_to_mint(identifier: str) -> Optional[str]:
+def resolve_symbol_to_mint(symbol: str) -> Optional[str]:
     """
-    If identifier is a known symbol (e.g. "BONK"), return its mint address.
-    Returns None if not found.
+    If `symbol` (case-insensitive) exists in the SPL Token List, return its mint.
+    Else return None.
     """
-    symbol = identifier.upper()
-    token_map = get_token_list()
-    return token_map.get(symbol)
+    return get_token_list_map().get(symbol.upper())
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 4) GET /wallet/{address}
-#    Fetch SOL & SPL balances for a wallet via Helius
+# 4) GET /wallet/{address}  →  returns SOL + SPL balances via Helius
 # ────────────────────────────────────────────────────────────────────────────
 @app.get("/wallet/{address}", response_model=WalletResponse)
 def get_wallet_balance(address: str):
     """
     Fetch SOL and SPL token balances for a given Solana wallet address via Helius.
-    Always returns JSON, even if balances are zero. Raises 400 for invalid address format.
+    Always returns JSON (even if zero balance). Raises 400 for invalid address format.
     """
-    # Validate - very basic length check (32-44 chars for base58)
+    # Basic Base58 length check: 32–44 characters
     if len(address) < 32 or len(address) > 44:
         raise HTTPException(status_code=400, detail="Invalid Solana address format.")
 
@@ -97,24 +94,22 @@ def get_wallet_balance(address: str):
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
         raise HTTPException(
-            status_code=502,
-            detail=f"Helius RPC error while fetching wallet balances: {e}",
+            status_code=502, detail=f"Helius RPC error while fetching wallet balances: {e}"
         )
 
     data = resp.json()
-    # Example response:
-    #   { "owner": "ADDRESS", "lamports": 1234567890,
-    #     "tokens": [ { "mint": "MINT", "amount": "1000000", "decimals": 6, ... }, … ] }
+    # Helius returns:
+    #   { "owner": "...", "lamports": <int>, "tokens": [ { "mint": "...", "amount": "123456", "decimals": 6, ... }, ... ] }
 
     sol_lamports = data.get("lamports", 0)
-    sol_balance = sol_lamports / 1e9
+    sol_balance = sol_lamports / 1e9  # convert lamports → SOL
 
     token_list = []
     for t in data.get("tokens", []):
         amt_str = t.get("amount", "0")
         dec = t.get("decimals", 0)
         try:
-            human_amt = int(amt_str) / (10**dec) if dec >= 0 else int(amt_str)
+            human_amt = int(amt_str) / (10 ** dec) if dec >= 0 else int(amt_str)
         except Exception:
             human_amt = 0
         token_list.append(
@@ -130,39 +125,35 @@ def get_wallet_balance(address: str):
 
 # ────────────────────────────────────────────────────────────────────────────
 # 5) GET /price/{identifier}
-#    If {identifier} looks like a 32–44 char base58 string: treat as mint
-#    Otherwise treat as symbol → resolve mint via SPL Token List
+#    Accepts either a mint address (32–44 chars) or a symbol (e.g. "BONK", "RIZZMAS")
 # ────────────────────────────────────────────────────────────────────────────
 @app.get("/price/{identifier}")
 def get_token_price(identifier: str):
     """
-    Fetch token price given either a mint address (32-44 chars) or a symbol (e.g. "BONK").
-
-    1) If len(identifier) in [32..44], assume it's a mint.  
-    2) Else, treat as symbol, look up mint from the SPL Token List.  
-    3) If symbol not found ⇒ 400 with helpful message.  
-    4) Once we have the mint, call Helius price API:
-         https://api.helius.xyz/v0/token/price?addresses[]=<mint>&api-key=<KEY>
+    Fetch token price by either:
+      - Mint address (32–44 characters)
+      - Symbol (e.g. "BONK", "RIZZMAS"), resolved via the SPL Token List
+    Once we have a mint, call Helius Price API:
+      https://api.helius.xyz/v0/token/price?addresses[]=<mint>&api-key=<KEY>
     """
+    # Decide if `identifier` is a mint or a symbol:
     mint: Optional[str] = None
 
-    # Step A) If identifier length matches a typical mint length, accept it as a mint
     if 32 <= len(identifier) <= 44:
+        # Looks like a mint (Base58 length)
         mint = identifier
     else:
-        # Step B) Try to resolve identifier as a symbol → mint
+        # Treat as symbol → look up in token list
         mint = resolve_symbol_to_mint(identifier)
         if not mint:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"‘{identifier}’ is not a valid on-chain mint address (32–44 chars),\n"
-                    "and it was not found as a symbol in the SPL Token List.\n"
-                    "Make sure you either pass a valid mint address or a known symbol (e.g. BONK → DezXbQ…)."
-                )
+                    f"‘{identifier}’ is neither a valid mint (32–44 chars) nor a known symbol.\n"
+                    f"Make sure you pass an on‐chain mint address or a valid token symbol (e.g. BONK → DezXbQ3iE4U6siJ33rMZ9Gx8ZUGGLgtd4MUCZ3B9hJtG)."
+                ),
             )
 
-    # Step C) Call Helius to fetch price
     helius_url = (
         "https://api.helius.xyz/v0/token/price"
         f"?addresses[]={mint}"
@@ -172,13 +163,10 @@ def get_token_price(identifier: str):
         resp = requests.get(helius_url, timeout=10)
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Helius price API error: {e}"
-        )
+        raise HTTPException(status_code=502, detail=f"Helius price API error: {e}")
 
     data = resp.json()
-    # Expect data = [ { "address": mint, "price": ..., … } ] or []
+    # Helius returns a list such as [ { "address": mint, "price": 0.00000123, … } ]
     if not isinstance(data, list) or len(data) == 0:
         raise HTTPException(status_code=404, detail=f"No price data found for mint {mint}")
 
@@ -187,26 +175,30 @@ def get_token_price(identifier: str):
 
 # ────────────────────────────────────────────────────────────────────────────
 # 6) GET /swap
-#    Simulate a swap (mock), accept both inputMint/input_mint and outputMint/output_mint
+#    Simulate a swap. Accepts either:
+#      - inputMint & outputMint
+#      - OR input_mint & output_mint
 # ────────────────────────────────────────────────────────────────────────────
 @app.get("/swap")
 def simulate_swap(
-    input_mint: str = Query(..., alias="inputMint"),  # accepts inputMint or input_mint
-    output_mint: str = Query(..., alias="outputMint"),  # accepts outputMint or output_mint
+    input_mint: str = Query(..., alias="inputMint"),    # alias covers both styles
+    output_mint: str = Query(..., alias="outputMint"),
     amount: float = Query(...),
 ):
     """
-    Simulate a swap. In production, replace this with real Jupiter route logic.
-    E.g. POST or GET to Jupiter /quote endpoints.
-    Here we simply return a mocked route.
+    Simulate a swap route (mock). In production, replace with Jupiter route logic.
+    Both query styles work:
+      /swap?inputMint=<mint>&outputMint=<mint>&amount=2
+      /swap?input_mint=<mint>&output_mint=<mint>&amount=2
     """
-    # Basic validation of mint format
+    # Validate mint lengths:
     if len(input_mint) < 32 or len(input_mint) > 44:
-        raise HTTPException(status_code=400, detail="Invalid inputMint format.")
+        raise HTTPException(status_code=400, detail="Invalid input_mint format.")
     if len(output_mint) < 32 or len(output_mint) > 44:
-        raise HTTPException(status_code=400, detail="Invalid outputMint format.")
+        raise HTTPException(status_code=400, detail="Invalid output_mint format.")
 
-    estimated_output = round(amount * 1000, 6)  # mock: 1 → 1000
+    # Mocked swap: pretend 1 unit of input_mint → 1000 units of output_mint
+    estimated_output = round(amount * 1000, 6)
 
     return {
         "inputMint": input_mint,
