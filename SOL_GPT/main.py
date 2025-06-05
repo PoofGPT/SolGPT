@@ -8,25 +8,17 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict
 from functools import lru_cache
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1) Create FastAPI app (no explicit `servers` here; we'll inject them later)
-# ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="SolGPT API",
     version="0.1.0",
     description="SolGPT—check Solana wallet balances and token prices via Helius",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2) Load Helius API key from environment
-# ─────────────────────────────────────────────────────────────────────────────
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 if not HELIUS_API_KEY:
-    raise RuntimeError("Please set the HELIUS_API_KEY environment variable")
+    raise RuntimeError("Please set the Helius_API_KEY environment variable")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3) Pydantic models for structured responses
-# ─────────────────────────────────────────────────────────────────────────────
+
 class TokenBalance(BaseModel):
     mint: str
     amount: str
@@ -45,9 +37,6 @@ class PriceResponse(BaseModel):
     symbol: Optional[str]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4) Caching & resolving the SPL Token List (symbol → mint) from GitHub
-# ─────────────────────────────────────────────────────────────────────────────
 TOKEN_LIST_URL = (
     "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
 )
@@ -75,15 +64,9 @@ def get_token_list_map() -> Dict[str, str]:
 
 
 def resolve_symbol_to_mint(symbol: str) -> Optional[str]:
-    """
-    Given a token symbol (case-insensitive), return its mint address (or None if not found).
-    """
     return get_token_list_map().get(symbol.upper())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5) Root endpoint
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
@@ -91,14 +74,8 @@ def root():
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6) GET /wallet/{address} → fetch SOL + SPL balances via Helius
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/wallet/{address}", response_model=WalletResponse)
 def get_wallet_balance(address: str):
-    """
-    Returns SOL balance and SPL token balances for a given Solana wallet via Helius.
-    """
     if len(address) < 32 or len(address) > 44:
         raise HTTPException(status_code=400, detail="Invalid Solana address format")
 
@@ -138,18 +115,9 @@ def get_wallet_balance(address: str):
     return WalletResponse(address=address, sol_balance=sol_balance, tokens=tokens)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7) GET /price/{identifier} → mint or symbol → price via Helius
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/price/{identifier}", response_model=PriceResponse)
 def get_token_price(identifier: str):
-    """
-    If `identifier` length is 32–44 chars, treat as mint.
-    Otherwise, treat as symbol and resolve mint via the SPL Token List.
-    Then fetch USD price via Helius.
-    """
     if 32 <= len(identifier) <= 44:
-        # Already a mint address
         mint = identifier
         symbol = None
     else:
@@ -158,7 +126,7 @@ def get_token_price(identifier: str):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"'{identifier}' is not a valid mint or a known symbol. "
+                    f"'{identifier}' is not a valid mint or known symbol. "
                     "Provide a 32–44 char mint address or an SPL token symbol."
                 )
             )
@@ -182,21 +150,12 @@ def get_token_price(identifier: str):
     return PriceResponse(address=mint, price=price_entry.get("price", 0.0), symbol=symbol)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8) GET /swap → mock swap simulation (inputMint, outputMint, amount)
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/swap")
 def simulate_swap(
     input_mint: str = Query(..., alias="inputMint"),
     output_mint: str = Query(..., alias="outputMint"),
     amount: float = Query(...),
 ):
-    """
-    Simulate a swap: returns a mocked route and estimated output.
-    Both query styles work:
-      /swap?inputMint=<mint>&outputMint=<mint>&amount=2
-      /swap?input_mint=<mint>&output_mint=<mint>&amount=2
-    """
     if len(input_mint) < 32 or len(input_mint) > 44:
         raise HTTPException(status_code=400, detail="Invalid inputMint format")
     if len(output_mint) < 32 or len(output_mint) > 44:
@@ -214,9 +173,6 @@ def simulate_swap(
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 9) Override OpenAPI schema to inject `servers` for the ChatGPT plugin
-# ─────────────────────────────────────────────────────────────────────────────
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -228,15 +184,11 @@ def custom_openapi():
         routes=app.routes,
     )
 
-    # Replace these URLs with your actual plugin endpoints:
+    # Only include the production (HTTPS) URL here
     openapi_schema["servers"] = [
         {
             "url": "https://solgpt-production.up.railway.app",
-            "description": "Production"
-        },
-        {
-            "url": "http://localhost:8000",
-            "description": "Local Development"
+            "description": "Production (Railway)"
         }
     ]
 
