@@ -1,4 +1,7 @@
+# main.py
+
 import os
+import requests
 import httpx
 import logging
 from fastapi import FastAPI, HTTPException, Query, Security
@@ -8,14 +11,13 @@ from fastapi.openapi.utils import get_openapi
 from functools import lru_cache
 from typing import List, Dict, Optional
 
-# ======= INITIALIZATION =======
 app = FastAPI(
     title="Ultimate Solana API",
-    version="2.0",
+    version="3.0",
     description="Complete Solana toolkit: Prices, Wallets & Swaps",
 )
 
-# CORS Configuration
+# Enable CORS so the docs UI can fetch
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,6 +35,8 @@ TOKEN_LIST_URLS = [
     "https://cdn.jsdelivr.net/gh/solana-labs/token-list@main/src/tokens/solana.tokenlist.json",
     "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
 ]
+COINGECKO_LIST_URL = "https://api.coingecko.com/api/v3/coins/list?include_platform=true"
+COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
 
 # ======= SECURITY =======
 API_KEY_NAME = "X-API-KEY"
@@ -45,33 +49,65 @@ async def validate_api_key(api_key: str = Security(api_key_header)):
 # ======= UTILITIES =======
 @lru_cache(maxsize=1)
 def load_token_list() -> List[Dict]:
-    """Cached token list loader with fallback URLs"""
+    """Download and cache SPL token list from fallback URLs."""
     for url in TOKEN_LIST_URLS:
         try:
-            response = httpx.get(url, timeout=10)
-            response.raise_for_status()
-            return response.json().get("tokens", [])
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            return r.json().get("tokens", [])
         except Exception as e:
             logging.warning(f"Failed to load token list from {url}: {e}")
     return []
 
-def resolve_identifier(identifier: str) -> str:
-    """Convert symbol to mint address"""
-    identifier = identifier.strip().upper()
-    if identifier in ["SOL", "WSOL"]:
-        return WSOL_MINT
-    if identifier == "USDC":
-        return USDC_MINT
-    # Check if already a mint address
-    if len(identifier) in [32, 44] and identifier.isalnum():
-        return identifier
-    # Search token list
-    for token in load_token_list():
-        if token.get("symbol", "").upper() == identifier:
-            return token["address"]
-    raise HTTPException(404, detail=f"Token '{identifier}' not found")
+@lru_cache(maxsize=1)
+def load_coingecko_list() -> List[Dict]:
+    """Download and cache CoinGecko coin list with platform details."""
+    r = requests.get(COINGECKO_LIST_URL, timeout=10)
+    r.raise_for_status()
+    return r.json()
 
-# ======= CORE FUNCTIONALITY =======
+@lru_cache(maxsize=1)
+def build_coingecko_mappings():
+    """
+    Build two lookup maps:
+      - mint_to_cgid: { <solana_mint> : <coingecko_id> }
+      - symbol_to_cgid: { <symbol_upper> : <coingecko_id> }
+    """
+    coin_list = load_coingecko_list()
+    mint_to_cgid: Dict[str, str] = {}
+    symbol_to_cgid: Dict[str, str] = {}
+    for entry in coin_list:
+        cg_id = entry.get("id")
+        sym = entry.get("symbol", "").upper()
+        symbol_to_cgid[sym] = cg_id
+        platforms = entry.get("platforms", {})
+        sol_mint = platforms.get("solana")
+        if sol_mint:
+            mint_to_cgid[sol_mint] = cg_id
+    return mint_to_cgid, symbol_to_cgid
+
+def resolve_identifier(identifier: str) -> str:
+    """
+    Convert symbol or mint to a valid Solana mint address.
+    Raises HTTPException if not found.
+    """
+    id_clean = identifier.strip().upper()
+    if id_clean in ["SOL", "WSOL"]:
+        return WSOL_MINT
+    if id_clean == "USDC":
+        return USDC_MINT
+
+    # If looks like a mint
+    if 32 <= len(id_clean) <= 44 and id_clean.isalnum():
+        return id_clean
+
+    # Search SPL token list by symbol
+    for token in load_token_list():
+        if token.get("symbol", "").upper() == id_clean:
+            return token.get("address")
+    raise HTTPException(status_code=404, detail=f"Token '{identifier}' not found")
+
+# ======= ENDPOINTS =======
 @app.get("/")
 async def root():
     return {
@@ -80,133 +116,168 @@ async def root():
             "wallet": "/wallet/{address}",
             "swap": "/swap?inputMint=...&outputMint=...&amount=..."
         },
-        "example": "/price/SOL or /wallet/your_wallet_address"
+        "example": "/price/SOL or /wallet/YourWalletAddress"
     }
 
 @app.get("/price/{identifier}")
-async def get_price(identifier: str):
-    """Get price and volume for any token"""
+async def get_token_price(identifier: str):
+    """
+    Get USD price of any SPL token by mint address or symbol.
+    Tries Jupiter first; if no route or error, falls back to CoinGecko.
+    """
     mint = resolve_identifier(identifier)
-    # Special case for USDC
+
+    # Static for USDC
     if mint == USDC_MINT:
-        return {
-            "mint": mint,
-            "price": 1.0,
-            "volume_24h": None,
-            "source": "static"
-        }
-    # Try Jupiter first
+        return {"mint": mint, "price": 1.0, "source": "static"}
+
+    # Step 1: get decimals via Helius
+    helius_key = os.getenv("HELIUS_API_KEY")
+    if not helius_key:
+        raise HTTPException(status_code=501, detail="Helius API key not configured")
+    try:
+        resp = requests.get(
+            HELIUS_TOKEN_METADATA_URL,
+            params={"addresses[]": mint, "api-key": helius_key},
+            timeout=5
+        )
+        resp.raise_for_status()
+        tm_data = resp.json()
+        if not isinstance(tm_data, list) or not tm_data:
+            raise HTTPException(status_code=404, detail="Token metadata not found")
+        decimals = tm_data[0].get("decimals")
+        if decimals is None:
+            raise HTTPException(status_code=404, detail="Decimals unavailable")
+    except requests.RequestException as e:
+        logging.warning(f"Helius metadata failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch token metadata")
+
+    # Step 2: Try Jupiter quote for 1 token → USDC
     try:
         async with httpx.AsyncClient() as client:
             params = {
                 "inputMint": mint,
                 "outputMint": USDC_MINT,
-                "amount": 10**6,  # 1 token if 6 decimals
+                "amount": 10**decimals,
                 "slippageBps": 50
             }
-            response = await client.get(JUPITER_QUOTE_API, params=params, timeout=5)
-            response.raise_for_status()
-            data = response.json()
-            return {
-                "mint": mint,
-                "price": int(data["outAmount"]) / 10**6,
-                "volume_24h": None,
-                "source": "jupiter"
-            }
+            r = await client.get(JUPITER_QUOTE_API, params=params, timeout=5)
+            r.raise_for_status()
+            data = r.json().get("data", [])
+            if data:
+                out_amount = data[0].get("outAmount")
+                if out_amount:
+                    price_usd = int(out_amount) / 10**6
+                    return {"mint": mint, "price": price_usd, "source": "jupiter"}
     except Exception as e:
         logging.warning(f"Jupiter failed: {e}")
-    # Fallback to Birdeye if available
-    if os.getenv("BIRDEYE_API_KEY"):
-        try:
-            async with httpx.AsyncClient() as client:
-                headers = {"X-API-KEY": os.getenv("BIRDEYE_API_KEY")}
-                response = await client.get(
-                    f"https://public-api.birdeye.so/public/price?address={mint}",
-                    headers=headers,
-                    timeout=5
-                )
-                response.raise_for_status()
-                data = response.json()
-                return {
-                    "mint": mint,
-                    "price": float(data["data"]["value"]),
-                    "volume_24h": float(data["data"]["volume"]["value"]),
-                    "source": "birdeye"
-                }
-        except Exception as e:
-            logging.warning(f"Birdeye failed: {e}")
-    raise HTTPException(503, detail="All price sources failed")
+
+    # Step 3: Fallback to CoinGecko
+    mint_to_cgid, symbol_to_cgid = build_coingecko_mappings()
+    cg_id = mint_to_cgid.get(mint)
+    if not cg_id:
+        # also try symbol mapping if identifier was a symbol
+        sym = identifier.strip().upper().lstrip("$")
+        cg_id = symbol_to_cgid.get(sym)
+    if not cg_id:
+        raise HTTPException(status_code=404, detail="Token not found on CoinGecko")
+
+    try:
+        cg_resp = requests.get(
+            COINGECKO_PRICE_URL,
+            params={"ids": cg_id, "vs_currencies": "usd"},
+            timeout=5
+        )
+        cg_resp.raise_for_status()
+        price_data = cg_resp.json()
+        usd_price = price_data.get(cg_id, {}).get("usd")
+        if usd_price is None:
+            raise HTTPException(status_code=404, detail="Price not available on CoinGecko")
+        return {"mint": mint, "price": usd_price, "source": "coingecko"}
+    except requests.RequestException as e:
+        logging.warning(f"CoinGecko failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch price from CoinGecko")
 
 @app.get("/wallet/{address}")
 async def get_wallet_balances(address: str):
-    """Get SOL and SPL token balances for a wallet"""
+    """
+    Get SOL & SPL token balances for a wallet via Helius.
+    """
     if len(address) < 32 or len(address) > 44:
-        raise HTTPException(400, detail="Invalid Solana address")
-    if not os.getenv("HELIUS_API_KEY"):
-        raise HTTPException(501, detail="Helius API key not configured")
+        raise HTTPException(status_code=400, detail="Invalid Solana address")
+
+    helius_key = os.getenv("HELIUS_API_KEY")
+    if not helius_key:
+        raise HTTPException(status_code=501, detail="Helius API key not configured")
+
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(
+            r = await client.get(
                 HELIUS_BALANCE_URL.format(address=address),
-                params={"api-key": os.getenv("HELIUS_API_KEY")},
+                params={"api-key": helius_key},
                 timeout=10
             )
-            response.raise_for_status()
-            data = response.json()
+            r.raise_for_status()
+            data = r.json()
             sol_balance = data.get("lamports", 0) / 10**9
             tokens = []
-            for token in data.get("tokens", []):
-                tokens.append({
-                    "mint": token["mint"],
-                    "amount": str(int(token["amount"]) / 10**token["decimals"]),
-                    "decimals": token["decimals"]
-                })
-            return {
-                "address": address,
-                "sol_balance": sol_balance,
-                "tokens": tokens
-            }
+            for t in data.get("tokens", []):
+                amt = int(t["amount"]) / 10**t["decimals"]
+                tokens.append({"mint": t["mint"], "amount": str(amt), "decimals": t["decimals"]})
+            return {"address": address, "sol_balance": sol_balance, "tokens": tokens}
     except Exception as e:
-        raise HTTPException(502, detail=f"Helius error: {str(e)}")
+        logging.warning(f"Helius balance failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch wallet balances")
 
 @app.get("/swap")
 async def simulate_swap(
-    inputMint: str = Query(..., description="Input token mint address"),
-    outputMint: str = Query(..., description="Output token mint address"),
+    inputMint: str = Query(..., description="Input token mint or symbol"),
+    outputMint: str = Query(..., description="Output token mint or symbol"),
     amount: float = Query(..., description="Amount to swap"),
-    slippageBps: int = Query(50, description="Slippage in basis points (1/100th percent)")
+    slippageBps: int = Query(50, description="Slippage in basis points")
 ):
-    """Get real swap quote from Jupiter"""
+    """
+    Get real swap quote from Jupiter. Accepts mint or symbol for input/output.
+    """
     try:
-        input_mint = resolve_identifier(inputMint)
-        output_mint = resolve_identifier(outputMint)
+        in_mint = resolve_identifier(inputMint)
+        out_mint = resolve_identifier(outputMint)
+    except HTTPException as e:
+        raise e
+
+    try:
         async with httpx.AsyncClient() as client:
             params = {
-                "inputMint": input_mint,
-                "outputMint": output_mint,
-                "amount": int(amount * 10**6),  # Assuming 6 decimals
+                "inputMint": in_mint,
+                "outputMint": out_mint,
+                "amount": int(amount * 10**6),  # assume 6 decimals
                 "slippageBps": slippageBps
             }
-            response = await client.get(JUPITER_QUOTE_API, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+            r = await client.get(JUPITER_QUOTE_API, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json().get("data", [])
+            if not data:
+                raise HTTPException(status_code=404, detail="No liquidity route found")
+            best = data[0]
             return {
-                "inputMint": input_mint,
-                "outputMint": output_mint,
+                "inputMint": in_mint,
+                "outputMint": out_mint,
                 "inAmount": str(amount),
-                "outAmount": str(int(data["outAmount"]) / 10**6),
+                "outAmount": str(int(best["outAmount"]) / 10**6),
                 "slippageBps": slippageBps,
-                "route": data.get("route", []),
-                "priceImpact": data.get("priceImpactPct"),
-                "platformFee": data.get("platformFee")
+                "route": best.get("route", []),
+                "priceImpact": best.get("priceImpactPct"),
+                "platformFee": best.get("platformFee")
             }
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        raise HTTPException(502, detail=f"Swap error: {str(e)}")
+        logging.warning(f"Swap failed: {e}")
+        raise HTTPException(status_code=502, detail="Swap error")
 
-# ======= HEALTH ENDPOINT =======
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "services": ["jupiter", "helius"]}
+    return {"status": "healthy", "services": ["jupiter", "helius", "coingecko"]}
 
 # ======= OVERRIDE OPENAPI SCHEMA =======
 def custom_openapi():
@@ -219,10 +290,7 @@ def custom_openapi():
         routes=app.routes,
     )
     schema["servers"] = [
-        {
-            "url": "https://striking-illumination.up.railway.app",
-            "description": "Production"
-        }
+        {"url": "https://striking-illumination.up.railway.app", "description": "Production"}
     ]
     app.openapi_schema = schema
     return app.openapi_schema
