@@ -1,20 +1,22 @@
-# main.py
-
 import os
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List
 
 app = FastAPI()
 
-# Load your Helius API key from environment
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", None)
+# ────────────────────────────────────────────────────────────────────────────
+# 1) Load Helius API key (must be set in your environment: HELIUS_API_KEY)
+# ────────────────────────────────────────────────────────────────────────────
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 if not HELIUS_API_KEY:
-    # In Railway, make sure you set HELIUS_API_KEY under "Variables"
     raise RuntimeError("HELIUS_API_KEY environment variable is not set")
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 2) Pydantic models for response schemas
+# ────────────────────────────────────────────────────────────────────────────
 class TokenBalance(BaseModel):
     mint: str
     amount: str
@@ -27,108 +29,105 @@ class WalletResponse(BaseModel):
     tokens: List[TokenBalance]
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 3) GET /wallet/{address} → returns SOL + SPL balances via Helius
+# ────────────────────────────────────────────────────────────────────────────
 @app.get("/wallet/{address}", response_model=WalletResponse)
 def get_wallet_balance(address: str):
     """
-    Fetch SOL & SPL balances for a given wallet address using Helius.
+    Fetch SOL & SPL balances for a given wallet address from Helius.
+    Always returns a JSON object (even if balance is 0), never a 404 for a valid address.
     """
-    # Validate basic format (PDA or Base58), you can add more validation if needed
+    # Basic length check (Solana addresses are 32‐44 base58 chars); adjust if needed.
     if len(address) < 32 or len(address) > 44:
-        raise HTTPException(status_code=400, detail="Invalid Solana address")
-
+        raise HTTPException(status_code=400, detail="Invalid Solana address format")
+    
     helius_url = (
         f"https://api.helius.xyz/v0/addresses/{address}/balances"
         f"?api-key={HELIUS_API_KEY}"
     )
-
     try:
         resp = requests.get(helius_url, timeout=10)
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Helius RPC error: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Helius RPC error while fetching wallet balances: {e}"
+        )
 
     data = resp.json()
-
-    # Helius returns a structure like:
+    # Helius always returns a JSON like:
     # {
     #   "owner": "<address>",
-    #   "lamports": 1234567890,
-    #   "tokens": [
-    #     {
-    #       "mint": "<mint_address>",
-    #       "amount": "100000000",
-    #       "decimals": 6,
-    #       ...
-    #     },
-    #     ...
-    #   ]
+    #   "lamports": <int>,
+    #   "tokens": [ { "mint": "...", "amount": "1000000", "decimals": 6, ... }, ... ]
     # }
-    # If address is valid but empty, Helius still returns a JSON with lamports=0, tokens=[].
-
     sol_lamports = data.get("lamports", 0)
     sol_balance = sol_lamports / 1e9  # convert lamports to SOL
 
     token_list = []
     for t in data.get("tokens", []):
-        # Only include tokens with a positive balance
-        amt = t.get("amount", "0")
+        amt_str = t.get("amount", "0")
         dec = t.get("decimals", 0)
         try:
-            # Helius returns amount as a string; convert to float at human scale
-            human_amt = int(amt) / (10 ** dec) if dec >= 0 else int(amt)
+            human_amt = int(amt_str) / (10 ** dec) if dec >= 0 else int(amt_str)
         except Exception:
             human_amt = 0
-
         token_list.append(
             TokenBalance(
                 mint=t.get("mint", ""),
                 amount=str(human_amt),
-                decimals=dec,
+                decimals=dec
             )
         )
 
     return WalletResponse(address=address, sol_balance=sol_balance, tokens=token_list)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 4) GET /price/{mint} → returns token price via Helius Price API
+# ────────────────────────────────────────────────────────────────────────────
 @app.get("/price/{mint}")
 def get_token_price(mint: str):
     """
-    Fetch token price from Helius Price API:
-    https://api.helius.xyz/v0/token/price?addresses[]=<mint>&api-key=<key>
+    Fetch token price for a given mint from Helius Price API.
+    Returns the first JSON object in the Helius response list.
     """
     helius_url = (
         "https://api.helius.xyz/v0/token/price"
         f"?addresses[]={mint}"
         f"&api-key={HELIUS_API_KEY}"
     )
-
     try:
         resp = requests.get(helius_url, timeout=10)
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Helius price API error: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Helius price API error: {e}"
+        )
 
     data = resp.json()
-    # Helius returns a list: [ { "address": "...", "price": 0.123, ... } ]
+    # Helius returns a list like: [ { "address": "...", "price": 0.00123, ... } ]
     if not isinstance(data, list) or len(data) == 0:
         raise HTTPException(status_code=404, detail=f"No price data for mint {mint}")
 
     return data[0]
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# 5) GET /swap → simple mock simulation endpoint
+# ────────────────────────────────────────────────────────────────────────────
 @app.get("/swap")
 def simulate_swap(inputMint: str, outputMint: str, amount: float):
     """
-    Simulate a swap route using Helius’ (or a fallback mock if needed).
-    You can integrate Jupiter’s route API or return a simple mock.
+    Simulate a swap (mock). In production, replace this with Jupiter route logic.
     """
-    # For demonstration, we’ll return a mocked route.
-    # In production, replace this with real Jupiter route calls if you have an API.
     return {
         "inputMint": inputMint,
         "outputMint": outputMint,
         "amount": amount,
-        "estimatedOutput": amount * 1000,  # mock: pretend 1 SOL -> 1000 XYZ
+        "estimatedOutput": round(amount * 1000, 6),  # mock example
         "slippageBps": 50,
         "route": ["SOL", "USDC", outputMint],
         "platform": "Jupiter (mocked)",
