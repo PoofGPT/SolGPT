@@ -39,7 +39,7 @@ class PriceResponse(BaseModel):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 3) Caching & resolving SPL Token List (symbol → mint) via on‐chain list
+# 3) Caching & resolving SPL Token List (symbol → mint) via on-chain list
 # ────────────────────────────────────────────────────────────────────────────
 TOKEN_LIST_URL = (
     "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json"
@@ -49,7 +49,7 @@ TOKEN_LIST_URL = (
 @lru_cache(maxsize=1)
 def get_token_list_map() -> Dict[str, str]:
     """
-    Download & cache SPL Token List → returns { SYMBOL (upper) : mintAddress }
+    Download & cache SPL Token List → returns { SYMBOL (upper): mintAddress }
     """
     try:
         resp = requests.get(TOKEN_LIST_URL, timeout=10)
@@ -75,14 +75,23 @@ def resolve_symbol_to_mint(symbol: str) -> Optional[str]:
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 4) GET /wallet/{address} → fetch SOL + SPL balances via Helius
+# 4) Root endpoint
+# ────────────────────────────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {
+        "message": "Welcome to SolGPT API. Available endpoints: /wallet/{address}, /price/{token}, /swap"
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 5) GET /wallet/{address} → fetch SOL + SPL balances via Helius
 # ────────────────────────────────────────────────────────────────────────────
 @app.get("/wallet/{address}", response_model=WalletResponse)
 def get_wallet_balance(address: str):
     """
     Returns SOL balance and SPL token balances for a given Solana wallet via Helius.
     """
-    # Basic Base58 length check
     if len(address) < 32 or len(address) > 44:
         raise HTTPException(status_code=400, detail="Invalid Solana address format")
 
@@ -123,12 +132,13 @@ def get_wallet_balance(address: str):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 5) GET /price/{identifier} → mint or symbol → price via Helius
+# 6) GET /price/{identifier} → mint or symbol → price via Helius
 # ────────────────────────────────────────────────────────────────────────────
 @app.get("/price/{identifier}", response_model=PriceResponse)
 def get_token_price(identifier: str):
     """
-    If identifier length is 32–44 chars, treat as mint. Otherwise, treat as symbol and resolve mint.
+    If identifier length is 32–44 chars, treat as mint.
+    Otherwise, treat as symbol and resolve mint.
     Then fetch USD price via Helius.
     """
     if 32 <= len(identifier) <= 44:
@@ -156,7 +166,7 @@ def get_token_price(identifier: str):
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Error fetching price from Helius: {e}")
 
-    prices = resp.json()  # expects a list of price objects
+    prices = resp.json()
     if not isinstance(prices, list) or not prices:
         raise HTTPException(status_code=404, detail=f"No price data found for mint {mint}")
 
@@ -165,7 +175,7 @@ def get_token_price(identifier: str):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 6) GET /swap → mock swap simulation (inputMint, outputMint, amount)
+# 7) GET /swap → mock swap simulation (inputMint, outputMint, amount)
 # ────────────────────────────────────────────────────────────────────────────
 @app.get("/swap")
 def simulate_swap(
@@ -184,7 +194,6 @@ def simulate_swap(
     if len(output_mint) < 32 or len(output_mint) > 44:
         raise HTTPException(status_code=400, detail="Invalid outputMint format")
 
-    # Mock: 1 unit input → 1000 units output
     estimated_output = round(amount * 1000, 6)
     return {
         "inputMint": input_mint,
